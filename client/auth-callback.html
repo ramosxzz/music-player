@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyncBeat — Entrando...</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="bg-orbs"></div>
+  <div class="page" style="align-items:center;justify-content:center;gap:16px;">
+    <div class="index-logo" style="width:64px;height:64px;font-size:1.8rem;">🎵</div>
+    <h2>Autenticando...</h2>
+    <div class="loader" style="width:28px;height:28px;border-width:3px;"></div>
+    <p id="status-msg" style="font-size:.9rem;color:var(--text-muted);">Processando login...</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="/js/supabase-client.js"></script>
+  <script>
+    (async () => {
+      const msg = document.getElementById('status-msg');
+      try {
+        // Let Supabase SDK handle the OAuth callback (reads hash/query params)
+        const { data, error } = await sb.auth.getSession();
+        if (error) throw error;
+
+        // If no session yet, try exchanging the code
+        if (!data.session) {
+          const { error: err2 } = await sb.auth.exchangeCodeForSession(window.location.href);
+          if (err2) throw err2;
+        }
+
+        msg.textContent = 'Login realizado! Redirecionando...';
+
+        // Check if there's a room to go back to
+        const returnRoom = new URLSearchParams(window.location.search).get('room')
+          || sessionStorage.getItem('syncbeat_return_room');
+
+        setTimeout(() => {
+          if (returnRoom) {
+            sessionStorage.removeItem('syncbeat_return_room');
+            window.location.href = `/room.html?room=${returnRoom}`;
+          } else {
+            window.location.href = '/';
+          }
+        }, 800);
+      } catch (err) {
+        msg.textContent = 'Erro ao autenticar: ' + (err.message || 'Tente novamente.');
+        setTimeout(() => { window.location.href = '/'; }, 3000);
+      }
+    })();
+  </script>
+</body>
+</html>
