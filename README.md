@@ -195,8 +195,20 @@ music-player/
 | Problema | Solução |
 |---|---|
 | Login não funciona | Verifique se os Redirect URIs estão corretos no Google/Spotify e Supabase |
-| YouTube não funciona | Edge Function pode estar com instância Invidious indisponível. Aguarde e tente novamente. |
-| Spotify não funciona | Verifique se `SPOTIFY_CLIENT_ID` e `SPOTIFY_CLIENT_SECRET` estão configurados nos Secrets da Edge Function |
+| YouTube não funciona | No backend local, verifique `yt-dlp --version`. Na Edge Function, configure uma instância Cobalt própria em `COBALT_API_URLS` se as instâncias públicas falharem. |
+| Spotify não funciona | Com credenciais, configure `SPOTIFY_CLIENT_ID` e `SPOTIFY_CLIENT_SECRET`. Sem credenciais, o app usa fallback público via Spotify oEmbed e busca o áudio no YouTube. |
 | Upload não funciona | Verifique se o bucket `audio-uploads` existe e é público |
-| Áudio fora de sincronia | Recarregue a página (F5) para ressincronizar |
+| Áudio fora de sincronia | O app re-sincroniza periodicamente. Se persistir, recarregue a página (F5). |
 | Sala não encontrada | A sala pode ter sido encerrada quando o host desconectou |
+
+### Backend local para YouTube/Spotify
+
+O backend Node usa `yt-dlp` para gerar uma URL fresca de áudio quando o player carrega a música:
+
+```bash
+pipx install yt-dlp
+cd server
+npm start
+```
+
+Para Spotify com metadados completos, configure `server/.env` com as credenciais do Spotify. Sem elas, o app ainda tenta resolver via `open.spotify.com/oembed`.

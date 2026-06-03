@@ -5,11 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncBeat — Entrando...</title>
   <link rel="stylesheet" href="/style.css" />
+  <script>
+    (function() {
+      const theme = localStorage.getItem('syncbeat_theme') || 'dark';
+      if (theme === 'light') {
+        document.documentElement.classList.add('light-theme');
+      }
+    })();
+  </script>
 </head>
 <body>
-  <div class="bg-orbs"></div>
   <div class="page" style="align-items:center;justify-content:center;gap:16px;">
-    <div class="index-logo" style="width:64px;height:64px;font-size:1.8rem;">🎵</div>
+    <div class="index-logo" style="width:64px;height:64px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:18px;">
+      <img src="/logo.png" alt="SyncBeat Logo" style="width: 44px; height: 44px; object-fit: contain;" />
+    </div>
     <h2>Autenticando...</h2>
     <div class="loader" style="width:28px;height:28px;border-width:3px;"></div>
     <p id="status-msg" style="font-size:.9rem;color:var(--text-muted);">Processando login...</p>

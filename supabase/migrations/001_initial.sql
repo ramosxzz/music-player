@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS public.rooms (
   audio_offset        FLOAT DEFAULT 0,            -- posição do áudio em segundos
   current_track_index INT DEFAULT 0,
   loop                BOOLEAN DEFAULT false,
+  co_hosts            UUID[] DEFAULT '{}',
   created_at          TIMESTAMPTZ DEFAULT now()
 );
 

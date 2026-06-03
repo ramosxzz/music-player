@@ -9,7 +9,7 @@ const fs = require('fs');
 const cors = require('cors');
 
 const RoomManager = require('./roomManager');
-const { resolveSource, resolveUpload, initSpotify, checkYtDlp } = require('./sourceHandler');
+const { resolveSource, resolveUpload, resolveStreamUrl, initSpotify, checkYtDlp } = require('./sourceHandler');
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
@@ -87,6 +87,26 @@ app.post('/api/resolve', async (req, res) => {
   } catch (err) {
     console.error('[resolve] Error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Generate a fresh direct audio URL at playback time.
+app.get('/api/stream', async (req, res) => {
+  const { url } = req.query;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  try {
+    const directUrl = await resolveStreamUrl(url);
+    res.setHeader('Cache-Control', 'no-store');
+    res.redirect(302, directUrl);
+  } catch (err) {
+    console.error('[stream] Error:', err.message);
+    res.status(500).json({
+      error: 'Could not create a fresh audio stream. Check yt-dlp installation and try again.',
+      details: err.message,
+    });
   }
 });
 
@@ -263,21 +283,6 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('playback:loop', { loop: room.loop });
   });
 
-  // ── Heartbeat: Sync all clients ────────────────────────────────────────────
-  // Every 10 seconds, broadcast current position to all rooms
-  setInterval(() => {
-    for (const [roomId] of roomManager.rooms) {
-      const room = roomManager.getRoom(roomId);
-      if (!room || !room.isPlaying) continue;
-
-      io.to(roomId).emit('playback:sync', {
-        serverTime: Date.now(),
-        audioPosition: roomManager.getCurrentPosition(roomId),
-        isPlaying: room.isPlaying,
-      });
-    }
-  }, 10_000);
-
   // ── Disconnect ─────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     const affected = roomManager.removeListener(socket.id);
@@ -295,6 +300,21 @@ io.on('connection', (socket) => {
     console.log(`[Socket] Disconnected: ${socket.id}`);
   });
 });
+
+// ── Heartbeat: Sync all Socket.io clients ────────────────────────────────────
+// One process-wide interval. Creating it per connection causes duplicated work.
+setInterval(() => {
+  for (const [roomId] of roomManager.rooms) {
+    const room = roomManager.getRoom(roomId);
+    if (!room || !room.isPlaying) continue;
+
+    io.to(roomId).emit('playback:sync', {
+      serverTime: Date.now(),
+      audioPosition: roomManager.getCurrentPosition(roomId),
+      isPlaying: room.isPlaying,
+    });
+  }
+}, 10_000);
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
 

@@ -1,15 +1,17 @@
 /**
- * room.js — Room page logic
+ * room.js — Room page logic (HTML5 Audio only — no YouTube iframe)
  *
- * Uses Supabase Realtime instead of Socket.io:
- * - Broadcast: instant playback events (play/pause/seek)
- * - Postgres Changes: queue updates (always consistent with DB)
- * - Presence: who's in the room
+ * Audio is played via native <audio> element.
+ * The resolve-audio Edge Function returns direct streamable audio URLs via Cobalt.
+ *
+ * Uses Supabase Realtime:
+ * - Broadcast: instant playback events (play/pause/seek/trackChange)
+ * - Postgres Changes: queue updates
+ * - Presence: connected listeners
  *
  * State source of truth:
  * - rooms table → is_playing, started_at, audio_offset, current_track_index
  * - queue_items table → the playlist
- * - Presence state → connected listeners
  */
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -25,6 +27,7 @@ let state = {
   user: null,
   profile: null,
   isHost: false,
+  isController: false,
   roomData: null,
   queue: [],
   currentTrack: null,
@@ -37,80 +40,13 @@ let animFrameId = null;
 let audioCtx = null;
 let analyser = null;
 let sourceNode = null;
+let audioUnlocked = false;
+let pendingSync = null;
+let syncTimerId = null;
+let visualizerFrame = 0;
 
-// YouTube Player variables
-let ytPlayer = null;
-let ytPlayerReady = false;
-let ytProgressInterval = null;
-
-// YouTube Iframe API callback
-window.onYouTubeIframeAPIReady = function () {
-  const initialVideoId = state.currentTrack ? getYouTubeVideoId(state.currentTrack) : 'dQw4w9WgXcQ';
-
-  ytPlayer = new YT.Player('youtube-player', {
-    host: 'https://www.youtube-nocookie.com',
-    height: '200',
-    width: '200',
-    videoId: initialVideoId,
-    playerVars: {
-      playsinline: 1,
-      controls: 0,
-      disablekb: 1,
-      fs: 0,
-      rel: 0,
-      showinfo: 0,
-      modestbranding: 1
-    },
-    events: {
-      onReady: () => {
-        ytPlayerReady = true;
-        try {
-          ytPlayer.unMute();
-          if (dom.volumeSlider) {
-            ytPlayer.setVolume(parseFloat(dom.volumeSlider.value) * 100);
-          }
-        } catch (e) {}
-
-        // Se já tivermos carregado a música atual da sala, reinicializa a sincronização
-        if (state.currentTrack && (state.currentTrack.source_type === 'youtube' || state.currentTrack.source_type === 'spotify')) {
-          loadTrack(state.currentTrack, state.isPlaying);
-          const room = state.roomData;
-          if (room) {
-            const pos = room.audio_offset || 0;
-            const elapsed = room.is_playing && room.started_at
-              ? (Date.now() - new Date(room.started_at).getTime()) / 1000
-              : 0;
-            const currentPos = pos + elapsed;
-            syncAudio({ serverTime: Date.now(), audioPosition: currentPos, isPlaying: room.is_playing });
-          }
-        }
-      },
-      onStateChange: (event) => {
-        if (event.data === YT.PlayerState.ENDED) {
-          if (!state.isHost) return;
-          if (state.loop) {
-            hostSeek(0);
-            hostPlay();
-          } else {
-            hostNext();
-          }
-        }
-      },
-      onError: (err) => {
-        console.error('YouTube player error:', err);
-        showToast('Erro ao reproduzir vídeo do YouTube.', 'error');
-      }
-    }
-  });
-};
-
-// Injeta dinamicamente o script da API do YouTube Iframe para evitar condições de corrida (race conditions)
-(function () {
-  const tag = document.createElement('script');
-  tag.src = "https://www.youtube.com/iframe_api";
-  const firstScriptTag = document.getElementsByTagName('script')[0];
-  firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
-})();
+const DRIFT_CORRECTION_SECONDS = 0.75;
+const SYNC_INTERVAL_MS = 5000;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DOM
@@ -174,6 +110,7 @@ const dom = {
 
   visualizer:         $('visualizer'),
   audioPlayer:        $('audio-player'),
+  themeToggle:        $('theme-toggle'),
 };
 
 const audio = dom.audioPlayer;
@@ -186,13 +123,13 @@ function showToast(msg, type = 'info', duration = 3500) {
   const c = $('toast-container');
   const t = document.createElement('div');
   t.className = `toast ${type}`;
-  t.innerHTML = `<span>${{success:'✅',error:'❌',info:'ℹ️'}[type]||''}</span><span>${msg}</span>`;
+  t.innerHTML = `<span></span><span>${msg}</span>`;
   c.appendChild(t);
   setTimeout(() => { t.style.animation = 'toastOut .3s ease forwards'; setTimeout(() => t.remove(), 300); }, duration);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Audio
+// Audio — HTML5 Native (no YouTube iframe)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function formatTime(s) {
@@ -201,14 +138,69 @@ function formatTime(s) {
   return `${m}:${sec.toString().padStart(2, '0')}`;
 }
 
+function getTrackUrl(track) {
+  return track?.audio_url || track?.audioUrl || '';
+}
+
+function getTrackSource(track) {
+  return track?.source_type || track?.sourceType || 'url';
+}
+
+function estimateRoomPosition(roomData = state.roomData) {
+  if (!roomData) return 0;
+
+  const offset = Number(roomData.audio_offset || 0);
+  if (!roomData.is_playing || !roomData.started_at) return offset;
+
+  const startedAt = new Date(roomData.started_at).getTime();
+  if (!Number.isFinite(startedAt)) return offset;
+
+  return Math.max(0, offset + (Date.now() - startedAt) / 1000);
+}
+
+function clampAudioPosition(position, track = state.currentTrack) {
+  const duration = Number.isFinite(audio.duration) && audio.duration > 0
+    ? audio.duration
+    : Number(track?.duration || 0);
+
+  if (!Number.isFinite(position)) return 0;
+  if (!duration) return Math.max(0, position);
+  return Math.max(0, Math.min(position, Math.max(0, duration - 0.25)));
+}
+
+async function resolveAudioInput(input) {
+  const body = JSON.stringify({ input });
+  const canUseLocalBackend =
+    ['localhost', '127.0.0.1'].includes(location.hostname) && location.port === '3000';
+
+  if (canUseLocalBackend) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 35_000);
+      const res = await fetch('/api/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (res.ok) return { data: await res.json(), error: null };
+      if (res.status !== 404) {
+        const data = await res.json().catch(() => null);
+        return { data, error: { message: data?.error || res.statusText } };
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') console.warn('Backend local indisponível, usando Supabase:', err);
+    }
+  }
+
+  return sb.functions.invoke('resolve-audio', { body: { input } });
+}
+
 function getOrCreateAudioCtx() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    analyser.connect(audioCtx.destination);
-    sourceNode = audioCtx.createMediaElementSource(audio);
-    sourceNode.connect(analyser);
   }
   return audioCtx;
 }
@@ -216,43 +208,31 @@ function getOrCreateAudioCtx() {
 let autoplayPromptActive = false;
 
 function showAutoplayPrompt() {
-  if (autoplayPromptActive) return;
+  if (autoplayPromptActive || audioUnlocked) return;
   autoplayPromptActive = true;
 
   const bar = document.createElement('div');
   bar.id = 'autoplay-prompt-bar';
   bar.className = 'autoplay-prompt-bar';
   bar.innerHTML = `
-    <span>🔊 O navegador bloqueou o som automático. Clique para ativar e sincronizar!</span>
+    <span>Clique para ativar o som e sincronizar!</span>
     <button id="autoplay-unlock-btn">Ativar Som</button>
   `;
   document.body.appendChild(bar);
 
   const unlock = () => {
+    audioUnlocked = true;
     getOrCreateAudioCtx().resume();
-
-    const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
-
-    if (isYt) {
-      if (ytPlayerReady && ytPlayer && typeof ytPlayer.playVideo === 'function') {
-        try {
-          ytPlayer.unMute();
-          ytPlayer.playVideo();
-          bar.remove();
-          autoplayPromptActive = false;
-          document.removeEventListener('click', unlock);
-        } catch (e) {
-          console.warn('Erro ao destravar som do YouTube:', e);
-        }
-      }
-    } else {
+    if (state.isPlaying) {
       audio.play().then(() => {
         bar.remove();
         autoplayPromptActive = false;
         document.removeEventListener('click', unlock);
-      }).catch((err) => {
-        console.warn('Erro ao destravar áudio HTML5:', err);
-      });
+      }).catch(() => {});
+    } else {
+      bar.remove();
+      autoplayPromptActive = false;
+      document.removeEventListener('click', unlock);
     }
   };
 
@@ -263,159 +243,93 @@ function showAutoplayPrompt() {
   document.addEventListener('click', unlock);
 }
 
-function checkYtAutoplay() {
-  if (state.isPlaying && ytPlayerReady && ytPlayer) {
-    try {
-      const stateCode = ytPlayer.getPlayerState();
-      if (stateCode !== YT.PlayerState.PLAYING) {
-        showAutoplayPrompt();
-      }
-    } catch (e) {}
-  }
-}
-
-function getYouTubeVideoId(track) {
-  if (!track) return null;
-  const url = track.audio_url || track.original_url;
-  if (!url) return null;
-
-  const patterns = [
-    /[?&]v=([A-Za-z0-9_-]{11})/,
-    /youtu\.be\/([A-Za-z0-9_-]{11})/,
-    /embed\/([A-Za-z0-9_-]{11})/,
-    /shorts\/([A-Za-z0-9_-]{11})/,
-  ];
-  for (const p of patterns) {
-    const m = url.match(p);
-    if (m) return m[1];
-  }
-  return null;
-}
-
-function startYtProgressInterval() {
-  if (ytProgressInterval) clearInterval(ytProgressInterval);
-
-  ytProgressInterval = setInterval(() => {
-    if (ytPlayerReady && ytPlayer && typeof ytPlayer.getCurrentTime === 'function') {
-      try {
-        const stateCode = ytPlayer.getPlayerState();
-        if (stateCode === YT.PlayerState.PLAYING) {
-          const cur = ytPlayer.getCurrentTime();
-          const dur = ytPlayer.getDuration() || state.currentTrack?.duration || 0;
-          dom.currentTime.textContent = formatTime(cur);
-          dom.totalTime.textContent = formatTime(dur);
-          if (dur > 0) dom.progressBar.style.width = `${(cur / dur) * 100}%`;
-        }
-      } catch (e) {
-        // Ignora erros temporários se o player estiver recarregando
-      }
-    }
-  }, 250);
-}
-
+// Sync audio position and play/pause state with the room
 function syncAudio({ serverTime, audioPosition, isPlaying }) {
-  if (!state.currentTrack) return;
-  const isYt = state.currentTrack.source_type === 'youtube' || state.currentTrack.source_type === 'spotify';
+  const trackUrl = getTrackUrl(state.currentTrack);
+  if (!state.currentTrack || !trackUrl) return;
+
+  if (audio.dataset.trackId !== state.currentTrack.id || audio.dataset.trackUrl !== trackUrl) {
+    loadTrack(state.currentTrack, false);
+  }
 
   let pos = audioPosition;
   if (isPlaying && serverTime) pos += (Date.now() - serverTime) / 1000;
+  pos = clampAudioPosition(pos);
 
-  if (isYt) {
-    if (ytPlayerReady && ytPlayer && typeof ytPlayer.getPlayerState === 'function') {
-      try {
-        const currentPos = ytPlayer.getCurrentTime();
-        if (Math.abs(currentPos - pos) > 0.8) {
-          ytPlayer.seekTo(pos, true);
-        }
-        if (isPlaying) {
-          const stateCode = ytPlayer.getPlayerState();
-          if (stateCode !== YT.PlayerState.PLAYING) {
-            ytPlayer.unMute();
-            ytPlayer.playVideo();
-            setTimeout(checkYtAutoplay, 1500);
-          }
-          startYtProgressInterval();
-        } else {
-          ytPlayer.pauseVideo();
-          if (ytProgressInterval) {
-            clearInterval(ytProgressInterval);
-            ytProgressInterval = null;
-          }
-        }
-      } catch (e) {
-        console.warn('Erro ao sincronizar YouTube:', e);
-      }
+  if (audio.readyState === HTMLMediaElement.HAVE_NOTHING) {
+    pendingSync = { serverTime, audioPosition, isPlaying };
+    audio.load();
+    return;
+  }
+
+  if (isPlaying) {
+    if (Math.abs(audio.currentTime - pos) > DRIFT_CORRECTION_SECONDS) audio.currentTime = pos;
+    if (!audioUnlocked && dom.joinOverlay.style.display !== 'none') return;
+    if (audioUnlocked) {
+      try { getOrCreateAudioCtx().resume(); } catch (_) {}
     }
+    audio.play().catch((err) => {
+      if (err.name === 'NotAllowedError') showAutoplayPrompt();
+    });
   } else {
-    if (Math.abs(audio.currentTime - pos) > 0.5) audio.currentTime = Math.max(0, pos);
-    if (isPlaying) {
-      getOrCreateAudioCtx().resume();
-      audio.play().catch((err) => {
-        if (err.name === 'NotAllowedError') {
-          showAutoplayPrompt();
-        }
-      });
-    } else {
-      audio.pause();
-    }
+    if (Math.abs(audio.currentTime - pos) > 0.5) audio.currentTime = pos;
+    audio.pause();
   }
 }
 
+// Load a track into the HTML5 audio player
 function loadTrack(track, autoPlay = false) {
   if (!track) return;
+
+  const trackUrl = getTrackUrl(track);
+  const isSameTrack = state.currentTrack && state.currentTrack.id === track.id;
+  const currentPos = isSameTrack ? audio.currentTime : 0;
+
+  if (state.currentTrack && state.currentTrack.id !== track.id) {
+    if (state.retryCounts) delete state.retryCounts[state.currentTrack.id];
+  }
   state.currentTrack = track;
 
-  if (ytProgressInterval) {
-    clearInterval(ytProgressInterval);
-    ytProgressInterval = null;
+  if (audio.dataset.trackId !== track.id || audio.dataset.trackUrl !== trackUrl) {
+    audio.dataset.trackId = track.id;
+    audio.dataset.trackUrl = trackUrl;
+    audio.src = trackUrl;
+    audio.load();
   }
 
-  const isYt = track.source_type === 'youtube' || track.source_type === 'spotify';
+  if (currentPos > 0) {
+    pendingSync = { serverTime: Date.now(), audioPosition: currentPos, isPlaying: false };
+  }
 
-  if (isYt) {
-    audio.pause();
-    audio.src = '';
-
-    const videoId = getYouTubeVideoId(track);
-    if (videoId && ytPlayerReady && ytPlayer && typeof ytPlayer.cueVideoById === 'function') {
-      try {
-        ytPlayer.cueVideoById({ videoId });
-        if (autoPlay) {
-          ytPlayer.unMute();
-          ytPlayer.playVideo();
-          startYtProgressInterval();
-          setTimeout(checkYtAutoplay, 1500);
-        }
-      } catch (e) {
-        console.warn('Erro ao cueVideo no YouTube:', e);
-      }
-    }
-  } else {
-    if (ytPlayerReady && ytPlayer && typeof ytPlayer.stopVideo === 'function') {
-      try {
-        ytPlayer.stopVideo();
-      } catch (e) {}
-    }
-    audio.src = track.audio_url;
-    audio.load();
-    if (autoPlay) {
-      getOrCreateAudioCtx().resume();
-      audio.play().catch((err) => {
-        if (err.name === 'NotAllowedError') {
-          showAutoplayPrompt();
-        }
-      });
-    }
+  if (autoPlay && trackUrl) {
+    syncAudio({
+      serverTime: Date.now(),
+      audioPosition: estimateRoomPosition(),
+      isPlaying: true,
+    });
   }
 
   updateNowPlayingUI(track);
 }
 
-audio.addEventListener('timeupdate', () => {
-  const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
-  if (isYt) return; // O YouTube gerencia o próprio tempo
+// Audio element events
+audio.addEventListener('loadedmetadata', () => {
+  if (!pendingSync) return;
+  const sync = pendingSync;
+  pendingSync = null;
+  syncAudio(sync);
+});
 
-  const cur = audio.currentTime, dur = audio.duration || state.currentTrack?.duration || 0;
+audio.addEventListener('canplay', () => {
+  if (!pendingSync) return;
+  const sync = pendingSync;
+  pendingSync = null;
+  syncAudio(sync);
+});
+
+audio.addEventListener('timeupdate', () => {
+  const cur = audio.currentTime;
+  const dur = audio.duration || state.currentTrack?.duration || 0;
   dom.currentTime.textContent = formatTime(cur);
   dom.totalTime.textContent = formatTime(dur);
   if (dur > 0) dom.progressBar.style.width = `${(cur / dur) * 100}%`;
@@ -431,17 +345,51 @@ audio.addEventListener('ended', async () => {
   }
 });
 
-audio.addEventListener('error', () => {
-  const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
-  if (isYt) return; // Ignora erros do HTML5 audio se for faixa do YouTube
-  showToast('Erro ao carregar áudio. Tente outra fonte.', 'error');
+audio.addEventListener('error', async (e) => {
+  const track = state.currentTrack;
+  if (!track) return;
+  console.error('Audio error:', e);
+
+  // Se o link expirou e não for um arquivo local, tentamos re-resolver automaticamente (limite de 1 tentativa por track)
+  state.retryCounts = state.retryCounts || {};
+  const retries = state.retryCounts[track.id] || 0;
+
+  if (track.original_url && getTrackSource(track) !== 'upload' && retries < 1) {
+    state.retryCounts[track.id] = retries + 1;
+    showToast('Link de áudio expirado. Atualizando automaticamente...', 'info');
+    try {
+      const { data, error } = await resolveAudioInput(track.original_url);
+
+      if (error || !data?.ok) throw new Error(data?.error || error?.message || 'Erro ao resolver');
+
+      const newAudioUrl = data.track.audioUrl;
+
+      // Se formos o host, atualizamos no banco para todos os ouvintes
+      try {
+        const { error: updateErr } = await sb.from('queue_items')
+          .update({ audio_url: newAudioUrl })
+          .eq('id', track.id);
+        if (updateErr) console.warn('Erro ao atualizar URL no banco:', updateErr);
+      } catch (dbErr) {
+        console.warn('Erro ao atualizar banco:', dbErr);
+      }
+
+      // Atualiza localmente e tenta reproduzir mantendo a posição
+      track.audio_url = newAudioUrl;
+      loadTrack(track, state.roomData?.is_playing);
+      showToast('Link de áudio atualizado com sucesso!', 'success');
+    } catch (resolveErr) {
+      console.error('Erro ao re-resolver áudio:', resolveErr);
+      showToast('Erro ao carregar áudio. Não foi possível re-resolver a música.', 'error');
+    }
+  } else {
+    showToast('Erro ao carregar áudio. O link pode ter expirado — tente readicionar a música.', 'error');
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Visualizer
+// Visualizer — Real AudioContext (works because we're using HTML5 audio)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-let mockAngles = Array.from({ length: 64 }, (_, i) => i * 0.1);
 
 function startVisualizer() {
   const canvas = dom.visualizer;
@@ -452,69 +400,77 @@ function startVisualizer() {
 
   function draw() {
     animFrameId = requestAnimationFrame(draw);
+    visualizerFrame = (visualizerFrame + 1) % 6;
+    if (!state.isPlaying && visualizerFrame !== 0) return;
+    if (state.isPlaying && visualizerFrame % 2 !== 0) return;
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
+    if (!analyser) {
+      // Visualizer not yet connected — show quiet idle bars
+      drawIdleBars(ctx, canvas, state.isPlaying);
+      return;
+    }
 
-    if (isYt) {
-      const numBars = 32;
-      const bw = (canvas.width / numBars) * 2.2;
-      let x = 0;
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(buf);
 
-      let volume = 1;
-      let isPlaying = state.isPlaying;
-
-      if (ytPlayerReady && ytPlayer && typeof ytPlayer.getVolume === 'function') {
-        try {
-          volume = ytPlayer.getVolume() / 100;
-          isPlaying = ytPlayer.getPlayerState() === YT.PlayerState.PLAYING;
-        } catch (e) {}
+    const bw = (canvas.width / buf.length) * 2.2;
+    let x = 0;
+    const isLight = document.documentElement.classList.contains('light-theme');
+    for (let i = 0; i < buf.length; i++) {
+      const h = (buf[i] / 255) * canvas.height;
+      if (h < 1) { x += bw; continue; }
+      const g = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - h);
+      if (isLight) {
+        g.addColorStop(0, 'rgba(0, 0, 0, 0.8)');
+        g.addColorStop(1, 'rgba(0, 0, 0, 0.1)');
+      } else {
+        g.addColorStop(0, 'rgba(255, 255, 255, 0.8)');
+        g.addColorStop(1, 'rgba(255, 255, 255, 0.1)');
       }
-
-      const speed = isPlaying && volume > 0 ? 0.05 : 0;
-
-      for (let i = 0; i < numBars; i++) {
-        mockAngles[i] = (mockAngles[i] || 0) + speed;
-        let factor = 0;
-        if (isPlaying && volume > 0) {
-          factor = Math.sin(mockAngles[i]) * 0.4 + Math.sin(mockAngles[i] * 2.3) * 0.3 + Math.cos(mockAngles[i] * 0.7) * 0.3;
-          factor = Math.max(0.05, Math.abs(factor));
-        } else if (isPlaying) {
-          factor = 0.02; // ondas mínimas se mutado
-        }
-
-        const h = factor * canvas.height * 0.85 * volume;
-
-        const g = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - h);
-        g.addColorStop(0, 'rgba(255, 255, 255, 0.4)');
-        g.addColorStop(1, 'rgba(255, 255, 255, 0.02)');
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.roundRect(x, canvas.height - h, bw - 2, h, 2);
-        ctx.fill();
-        x += bw;
-      }
-    } else {
-      if (!analyser) { ctx.clearRect(0, 0, canvas.width, canvas.height); return; }
-      const buf = new Uint8Array(analyser.frequencyBinCount);
-      analyser.getByteFrequencyData(buf);
-
-      const bw = (canvas.width / buf.length) * 2.2;
-      let x = 0;
-      for (let i = 0; i < buf.length; i++) {
-        const h = (buf[i] / 255) * canvas.height;
-        const g = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - h);
-        g.addColorStop(0, 'rgba(255, 255, 255, 0.5)');
-        g.addColorStop(1, 'rgba(255, 255, 255, 0.05)');
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.roundRect(x, canvas.height - h, bw - 2, h, 2);
-        ctx.fill();
-        x += bw;
-      }
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.roundRect(x, canvas.height - h, bw - 2, h, 2);
+      ctx.fill();
+      x += bw;
     }
   }
   draw();
+}
+
+let idleAngles = Array.from({ length: 32 }, (_, i) => i * 0.12);
+
+function drawIdleBars(ctx, canvas, isPlaying) {
+  const numBars = 32;
+  const bw = (canvas.width / numBars) * 2.2;
+  let x = 0;
+  const speed = isPlaying ? 0.04 : 0;
+  const isLight = document.documentElement.classList.contains('light-theme');
+
+  for (let i = 0; i < numBars; i++) {
+    idleAngles[i] = (idleAngles[i] || 0) + speed;
+    let factor = 0;
+    if (isPlaying) {
+      factor = Math.sin(idleAngles[i]) * 0.35 + Math.sin(idleAngles[i] * 2.1) * 0.3 + Math.cos(idleAngles[i] * 0.8) * 0.35;
+      factor = Math.max(0.04, Math.abs(factor));
+    }
+    const h = factor * canvas.height * 0.8;
+    if (h < 1) { x += bw; continue; }
+    const g = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - h);
+    if (isLight) {
+      g.addColorStop(0, 'rgba(0, 0, 0, 0.4)');
+      g.addColorStop(1, 'rgba(0, 0, 0, 0.05)');
+    } else {
+      g.addColorStop(0, 'rgba(255, 255, 255, 0.4)');
+      g.addColorStop(1, 'rgba(255, 255, 255, 0.05)');
+    }
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.roundRect(x, canvas.height - h, bw - 2, h, 2);
+    ctx.fill();
+    x += bw;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -522,10 +478,10 @@ function startVisualizer() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const SOURCE_BADGES = {
-  youtube: '<span class="badge badge-youtube">▶ YouTube</span>',
-  spotify: '<span class="badge badge-spotify">● Spotify</span>',
-  upload:  '<span class="badge badge-upload">📁 Upload</span>',
-  url:     '<span class="badge badge-url">🔗 URL</span>',
+  youtube: '<span class="badge badge-youtube">YouTube</span>',
+  spotify: '<span class="badge badge-spotify">Spotify</span>',
+  upload:  '<span class="badge badge-upload">Upload</span>',
+  url:     '<span class="badge badge-url">URL</span>',
 };
 
 function updateNowPlayingUI(track) {
@@ -542,7 +498,7 @@ function updateNowPlayingUI(track) {
   }
   dom.nowPlayingTrack.textContent = track.name;
   dom.nowPlayingArtist.textContent = track.artist || 'Desconhecido';
-  dom.sourceBadgeArea.innerHTML = SOURCE_BADGES[track.source_type] || '';
+  dom.sourceBadgeArea.innerHTML = SOURCE_BADGES[getTrackSource(track)] || '';
   const thumb = track.thumbnail;
   if (thumb) {
     dom.artworkPlaceholder.innerHTML = `<img src="${thumb}" alt="${track.name}" />`;
@@ -560,9 +516,9 @@ function updateNowPlayingUI(track) {
 function updatePlayState(isPlaying) {
   state.isPlaying = isPlaying;
   if (isPlaying) {
-    dom.playBtn.innerHTML = `<svg id="play-icon-svg" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/></svg>`;
+    dom.playBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/></svg>`;
   } else {
-    dom.playBtn.innerHTML = `<svg id="play-icon-svg" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>`;
+    dom.playBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>`;
   }
   dom.playingIndicator.classList.toggle('paused', !isPlaying);
 }
@@ -573,7 +529,7 @@ function setHostMode(isController) {
   dom.listenerOnlyBar.style.display = isController ? 'none' : '';
 
   if (state.isHost) {
-    dom.hostBadge.textContent = '👑 Host';
+    dom.hostBadge.textContent = 'Host';
     dom.hostBadge.style.display = '';
     dom.closeRoomBtn.style.display = '';
   } else if (isController) {
@@ -598,7 +554,7 @@ function renderQueue() {
   dom.queueCount.textContent = `${queue.length} música${queue.length !== 1 ? 's' : ''}`;
 
   if (!queue.length) {
-    dom.queueList.innerHTML = '<div class="queue-empty">A fila está vazia.</div>';
+    dom.queueList.innerHTML = '<div class="queue-empty">A fila está vazia. Adicione músicas!</div>';
     return;
   }
 
@@ -608,14 +564,14 @@ function renderQueue() {
 
   queue.forEach((track, i) => {
     const isActive = i === idx;
-    const sourceEmoji = { youtube:'▶', spotify:'●', upload:'📁', url:'🔗' }[track.source_type] || '🎵';
+    const sourceText = { youtube:'YT', spotify:'SP', upload:'UP', url:'LINK' }[getTrackSource(track)] || 'AUD';
     const item = document.createElement('div');
     item.className = `queue-item${isActive ? ' active' : ''}`;
     item.innerHTML = `
       <span class="queue-num">${i + 1}</span>
       <span class="queue-playing-icon" style="color:var(--accent-light)">♪</span>
       <div class="queue-thumb">
-        ${track.thumbnail ? `<img src="${track.thumbnail}" alt="${track.name}" />` : sourceEmoji}
+        ${track.thumbnail ? `<img src="${track.thumbnail}" alt="${track.name}" />` : `<span class="source-txt">${sourceText}</span>`}
       </div>
       <div class="queue-info">
         <div class="queue-name" title="${track.name}">${track.name}</div>
@@ -636,10 +592,8 @@ function renderQueue() {
 function renderListeners(presenceState) {
   const allListeners = Object.values(presenceState).flatMap((arr) => arr);
 
-  // Deduplica ouvintes pelo user_id para evitar duplicação no F5
   const uniqueListeners = [];
   const seenIds = new Set();
-
   for (const l of allListeners) {
     if (!l.user_id) continue;
     if (!seenIds.has(l.user_id)) {
@@ -657,20 +611,14 @@ function renderListeners(presenceState) {
     const isCurrentUserHost = state.user.id === state.roomData?.host_id;
 
     let tag = '';
-    if (isMainHost) {
-      tag = '<span class="listener-host-tag">Host</span>';
-    } else if (isCoHost) {
-      tag = '<span class="listener-cohost-tag">Co-Host</span>';
-    }
+    if (isMainHost) tag = '<span class="listener-host-tag">Host</span>';
+    else if (isCoHost) tag = '<span class="listener-cohost-tag">Co-Host</span>';
 
-    // Botão de ação para promover/rebaixar (apenas visível para o host principal)
     let actionBtn = '';
     if (isCurrentUserHost && !isMainHost) {
-      if (isCoHost) {
-        actionBtn = `<button class="btn-demote" data-user-id="${l.user_id}" title="Remover Co-Host">➖</button>`;
-      } else {
-        actionBtn = `<button class="btn-promote" data-user-id="${l.user_id}" title="Tornar Co-Host">➕</button>`;
-      }
+      actionBtn = isCoHost
+        ? `<button class="btn-demote" data-user-id="${l.user_id}" title="Remover Co-Host"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>`
+        : `<button class="btn-promote" data-user-id="${l.user_id}" title="Tornar Co-Host"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>`;
     }
 
     const item = document.createElement('div');
@@ -689,7 +637,6 @@ function renderListeners(presenceState) {
     dom.listenersList.appendChild(item);
   });
 
-  // Vincula eventos nos botões de promoção/rebaixamento
   dom.listenersList.querySelectorAll('.btn-promote').forEach(btn => {
     btn.addEventListener('click', () => promoteToCoHost(btn.dataset.userId));
   });
@@ -702,33 +649,17 @@ async function promoteToCoHost(userId) {
   if (!state.isHost) return;
   const currentCoHosts = state.roomData?.co_hosts || [];
   if (currentCoHosts.includes(userId)) return;
-
-  const newCoHosts = [...currentCoHosts, userId];
-  const { error } = await sb.from('rooms')
-    .update({ co_hosts: newCoHosts })
-    .eq('id', ROOM_ID);
-
-  if (error) {
-    showToast('Erro ao promover: ' + error.message, 'error');
-  } else {
-    showToast('Usuário promovido a Co-Host!', 'success');
-  }
+  const { error } = await sb.from('rooms').update({ co_hosts: [...currentCoHosts, userId] }).eq('id', ROOM_ID);
+  if (error) showToast('Erro ao promover: ' + error.message, 'error');
+  else showToast('Usuário promovido a Co-Host!', 'success');
 }
 
 async function demoteFromCoHost(userId) {
   if (!state.isHost) return;
   const currentCoHosts = state.roomData?.co_hosts || [];
-  const newCoHosts = currentCoHosts.filter(id => id !== userId);
-
-  const { error } = await sb.from('rooms')
-    .update({ co_hosts: newCoHosts })
-    .eq('id', ROOM_ID);
-
-  if (error) {
-    showToast('Erro ao remover promoção: ' + error.message, 'error');
-  } else {
-    showToast('Co-Host rebaixado a ouvinte.', 'success');
-  }
+  const { error } = await sb.from('rooms').update({ co_hosts: currentCoHosts.filter(id => id !== userId) }).eq('id', ROOM_ID);
+  if (error) showToast('Erro ao remover promoção: ' + error.message, 'error');
+  else showToast('Co-Host rebaixado a ouvinte.', 'success');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -736,27 +667,16 @@ async function demoteFromCoHost(userId) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function currentAudioPos() {
-  const rd = state.roomData;
-  if (!rd) return 0;
-
-  if (state.isController && state.currentTrack) {
-    const isYt = state.currentTrack.source_type === 'youtube' || state.currentTrack.source_type === 'spotify';
-    if (isYt && ytPlayerReady && ytPlayer && typeof ytPlayer.getCurrentTime === 'function') {
-      try {
-        return ytPlayer.getCurrentTime();
-      } catch (e) {}
-    } else if (!isYt && audio) {
-      return audio.currentTime;
-    }
+  if (state.isController && !audio.paused && Number.isFinite(audio.currentTime)) {
+    return audio.currentTime;
   }
-
-  if (!rd.is_playing || !rd.started_at) return rd.audio_offset || 0;
-  return (rd.audio_offset || 0) + (Date.now() - new Date(rd.started_at).getTime()) / 1000;
+  return estimateRoomPosition();
 }
 
 async function hostPlay() {
   const pos = currentAudioPos();
   const now = new Date().toISOString();
+  const serverTime = Date.now();
   const { error } = await sb.from('rooms').update({
     is_playing: true,
     started_at: now,
@@ -769,10 +689,10 @@ async function hostPlay() {
   realtimeChannel.send({
     type: 'broadcast',
     event: 'playback:play',
-    payload: { serverTime: Date.now(), audioPosition: pos },
+    payload: { serverTime, audioPosition: pos },
   });
   updatePlayState(true);
-  syncAudio({ serverTime: Date.now(), audioPosition: pos, isPlaying: true });
+  syncAudio({ serverTime, audioPosition: pos, isPlaying: true });
 }
 
 async function hostPause() {
@@ -791,30 +711,14 @@ async function hostPause() {
     event: 'playback:pause',
     payload: { audioPosition: pos },
   });
-
-  const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
-  if (isYt) {
-    if (ytPlayerReady && ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
-      try {
-        ytPlayer.pauseVideo();
-      } catch (e) {}
-    }
-    if (ytProgressInterval) {
-      clearInterval(ytProgressInterval);
-      ytProgressInterval = null;
-    }
-  } else {
-    audio.pause();
-  }
+  audio.pause();
   updatePlayState(false);
 }
 
 async function hostSeek(position) {
   const now = state.roomData?.is_playing ? new Date().toISOString() : null;
-  const { error } = await sb.from('rooms').update({
-    audio_offset: position,
-    started_at: now,
-  }).eq('id', ROOM_ID);
+  const serverTime = Date.now();
+  const { error } = await sb.from('rooms').update({ audio_offset: position, started_at: now }).eq('id', ROOM_ID);
   if (error) return;
 
   state.roomData = { ...state.roomData, audio_offset: position, started_at: now };
@@ -822,29 +726,31 @@ async function hostSeek(position) {
   realtimeChannel.send({
     type: 'broadcast',
     event: 'playback:seek',
-    payload: { serverTime: Date.now(), audioPosition: position, isPlaying: state.roomData.is_playing },
+    payload: { serverTime, audioPosition: position, isPlaying: state.roomData.is_playing },
   });
-  syncAudio({ serverTime: Date.now(), audioPosition: position, isPlaying: state.roomData.is_playing });
+  syncAudio({ serverTime, audioPosition: position, isPlaying: state.roomData.is_playing });
 }
 
 async function hostNext() {
   if (!state.queue.length) return;
   const nextIdx = (state.roomData.current_track_index + 1) % state.queue.length;
+  const startedAt = state.roomData.is_playing ? new Date().toISOString() : null;
+  const serverTime = Date.now();
   const { error } = await sb.from('rooms').update({
     current_track_index: nextIdx,
     audio_offset: 0,
-    started_at: state.roomData.is_playing ? new Date().toISOString() : null,
+    started_at: startedAt,
   }).eq('id', ROOM_ID);
   if (error) return;
 
-  state.roomData = { ...state.roomData, current_track_index: nextIdx, audio_offset: 0 };
+  state.roomData = { ...state.roomData, current_track_index: nextIdx, audio_offset: 0, started_at: startedAt };
   const track = state.queue[nextIdx];
   loadTrack(track, state.roomData.is_playing);
 
   realtimeChannel.send({
     type: 'broadcast',
     event: 'playback:trackChange',
-    payload: { serverTime: Date.now(), trackIndex: nextIdx, isPlaying: state.roomData.is_playing },
+    payload: { serverTime, audioPosition: 0, trackIndex: nextIdx, isPlaying: state.roomData.is_playing },
   });
   renderQueue();
 }
@@ -852,28 +758,29 @@ async function hostNext() {
 async function hostPrev() {
   if (!state.queue.length) return;
   const prevIdx = (state.roomData.current_track_index - 1 + state.queue.length) % state.queue.length;
+  const startedAt = state.roomData.is_playing ? new Date().toISOString() : null;
+  const serverTime = Date.now();
   const { error } = await sb.from('rooms').update({
     current_track_index: prevIdx,
     audio_offset: 0,
-    started_at: state.roomData.is_playing ? new Date().toISOString() : null,
+    started_at: startedAt,
   }).eq('id', ROOM_ID);
   if (error) return;
 
-  state.roomData = { ...state.roomData, current_track_index: prevIdx, audio_offset: 0 };
+  state.roomData = { ...state.roomData, current_track_index: prevIdx, audio_offset: 0, started_at: startedAt };
   const track = state.queue[prevIdx];
   loadTrack(track, state.roomData.is_playing);
 
   realtimeChannel.send({
     type: 'broadcast',
     event: 'playback:trackChange',
-    payload: { serverTime: Date.now(), trackIndex: prevIdx, isPlaying: state.roomData.is_playing },
+    payload: { serverTime, audioPosition: 0, trackIndex: prevIdx, isPlaying: state.roomData.is_playing },
   });
   renderQueue();
 }
 
 async function removeTrack(trackId) {
   await sb.from('queue_items').delete().eq('id', trackId);
-  // Queue re-fetched via Postgres Changes subscription
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -882,16 +789,15 @@ async function removeTrack(trackId) {
 
 async function resolveAndAddTrack(input, statusEl) {
   if (!input.trim()) return;
-  statusEl.innerHTML = '<span class="loader"></span> Resolvendo...';
+  statusEl.innerHTML = '<span class="loader"></span> Resolvendo e extraindo áudio...';
 
   try {
-    const { data, error } = await sb.functions.invoke('resolve-audio', {
-      body: { input },
-    });
+    const { data, error } = await resolveAudioInput(input);
 
     if (error || !data?.ok) throw new Error(data?.error || error?.message || 'Erro desconhecido');
 
     const track = data.track;
+    const isFirstTrack = state.queue.length === 0 && !state.isPlaying;
     const maxPos = state.queue.reduce((m, t) => Math.max(m, t.position), -1);
 
     const { error: insertErr } = await sb.from('queue_items').insert({
@@ -912,9 +818,16 @@ async function resolveAndAddTrack(input, statusEl) {
     statusEl.innerHTML = `✅ <strong>${track.name}</strong> adicionada.`;
     showToast(`"${track.name}" adicionada!`, 'success');
 
-    // Auto-play first track
-    if (state.queue.length === 0 && !state.isPlaying) {
-      setTimeout(hostPlay, 500);
+    // Auto-play: se era a primeira música e a sala está parada
+    if (isFirstTrack) {
+      setTimeout(async () => {
+        await refreshQueue();
+        const firstTrack = state.queue[0];
+        if (firstTrack && !state.isPlaying) {
+          loadTrack(firstTrack, false);
+          setTimeout(() => hostPlay(), 300);
+        }
+      }, 600);
     }
   } catch (err) {
     statusEl.innerHTML = `❌ ${err.message}`;
@@ -967,26 +880,15 @@ async function subscribeToRoom() {
     config: { broadcast: { self: false }, presence: { key: state.user.id } },
   });
 
-  // ── Presence (listener list) ────────────────────────────────────────────────
+  // Presence
   realtimeChannel
-    .on('presence', { event: 'sync' }, () => {
-      renderListeners(realtimeChannel.presenceState());
-    })
-    .on('presence', { event: 'join' }, ({ newPresences }) => {
-      renderListeners(realtimeChannel.presenceState());
-    })
-    .on('presence', { event: 'leave' }, ({ leftPresences }) => {
-      // If host left, show closed overlay
-      const hostLeft = leftPresences.some((p) => p.is_host && p.user_id !== state.user.id);
-      if (hostLeft && !state.isHost) {
-        audio.pause();
-        dom.closedMessage.textContent = 'O host saiu. A sala foi encerrada.';
-        dom.closedOverlay.style.display = 'flex';
-      }
+    .on('presence', { event: 'sync' }, () => renderListeners(realtimeChannel.presenceState()))
+    .on('presence', { event: 'join' }, () => renderListeners(realtimeChannel.presenceState()))
+    .on('presence', { event: 'leave' }, () => {
       renderListeners(realtimeChannel.presenceState());
     });
 
-  // ── Playback broadcasts ─────────────────────────────────────────────────────
+  // Playback broadcasts
   realtimeChannel
     .on('broadcast', { event: 'playback:play' }, ({ payload }) => {
       state.roomData = { ...state.roomData, is_playing: true, started_at: new Date(payload.serverTime).toISOString(), audio_offset: payload.audioPosition };
@@ -995,49 +897,49 @@ async function subscribeToRoom() {
     })
     .on('broadcast', { event: 'playback:pause' }, ({ payload }) => {
       state.roomData = { ...state.roomData, is_playing: false, audio_offset: payload.audioPosition, started_at: null };
-
-      const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
-      if (isYt) {
-        if (ytPlayerReady && ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
-          try {
-            ytPlayer.pauseVideo();
-          } catch (e) {}
-        }
-        if (ytProgressInterval) {
-          clearInterval(ytProgressInterval);
-          ytProgressInterval = null;
-        }
-      } else {
-        audio.currentTime = payload.audioPosition;
-        audio.pause();
-      }
+      syncAudio({ serverTime: Date.now(), audioPosition: payload.audioPosition, isPlaying: false });
       updatePlayState(false);
     })
     .on('broadcast', { event: 'playback:seek' }, ({ payload }) => {
-      state.roomData = { ...state.roomData, audio_offset: payload.audioPosition };
+      state.roomData = {
+        ...state.roomData,
+        is_playing: payload.isPlaying,
+        started_at: payload.isPlaying ? new Date(payload.serverTime).toISOString() : null,
+        audio_offset: payload.audioPosition,
+      };
       syncAudio({ ...payload });
       updatePlayState(payload.isPlaying);
     })
     .on('broadcast', { event: 'playback:trackChange' }, ({ payload }) => {
-      state.roomData = { ...state.roomData, current_track_index: payload.trackIndex, audio_offset: 0 };
+      state.roomData = {
+        ...state.roomData,
+        is_playing: payload.isPlaying,
+        started_at: payload.isPlaying ? new Date(payload.serverTime).toISOString() : null,
+        current_track_index: payload.trackIndex,
+        audio_offset: payload.audioPosition || 0,
+      };
       const track = state.queue[payload.trackIndex];
-      if (track) { loadTrack(track, payload.isPlaying); syncAudio({ ...payload, audioPosition: 0 }); }
+      if (track) {
+        loadTrack(track, payload.isPlaying);
+        if (payload.isPlaying) {
+          syncAudio({ ...payload, audioPosition: payload.audioPosition || 0 });
+        }
+      }
       updatePlayState(payload.isPlaying);
       renderQueue();
     })
     .on('broadcast', { event: 'playback:requestSync' }, ({ payload }) => {
-      if (!state.isHost) return;
-      const currentPos = currentAudioPos();
+      if (!state.isController) return;
       realtimeChannel.send({
         type: 'broadcast',
         event: 'playback:syncResponse',
         payload: {
           targetId: payload.requesterId,
           serverTime: Date.now(),
-          audioPosition: currentPos,
+          audioPosition: currentAudioPos(),
           isPlaying: state.isPlaying,
-          trackIndex: state.roomData?.current_track_index || 0
-        }
+          trackIndex: state.roomData?.current_track_index || 0,
+        },
       });
     })
     .on('broadcast', { event: 'playback:syncResponse' }, ({ payload }) => {
@@ -1045,63 +947,61 @@ async function subscribeToRoom() {
       if (state.roomData && state.roomData.current_track_index !== payload.trackIndex) {
         state.roomData.current_track_index = payload.trackIndex;
         const track = state.queue[payload.trackIndex];
-        if (track) loadTrack(track, payload.isPlaying);
+        if (track) loadTrack(track, false);
       }
-      syncAudio({
-        serverTime: payload.serverTime,
-        audioPosition: payload.audioPosition,
-        isPlaying: payload.isPlaying
-      });
+      state.roomData = {
+        ...state.roomData,
+        is_playing: payload.isPlaying,
+        started_at: payload.isPlaying ? new Date(payload.serverTime).toISOString() : null,
+        audio_offset: payload.audioPosition,
+      };
+      syncAudio({ serverTime: payload.serverTime, audioPosition: payload.audioPosition, isPlaying: payload.isPlaying });
       updatePlayState(payload.isPlaying);
     })
     .on('broadcast', { event: 'playback:roomClosed' }, () => {
       audio.pause();
-      if (ytPlayerReady && ytPlayer && typeof ytPlayer.stopVideo === 'function') {
-        try {
-          ytPlayer.stopVideo();
-        } catch (e) {}
-      }
       dom.closedMessage.textContent = 'A sala foi encerrada pelo Host.';
       dom.closedOverlay.style.display = 'flex';
     });
 
-  // ── Queue changes from DB ───────────────────────────────────────────────────
+  // Queue & room changes
   realtimeChannel
     .on('postgres_changes', {
-      event: '*',
-      schema: 'public',
-      table: 'queue_items',
-      filter: `room_id=eq.${ROOM_ID}`,
-    }, async () => {
-      await refreshQueue();
-    });
+      event: '*', schema: 'public', table: 'queue_items', filter: `room_id=eq.${ROOM_ID}`,
+    }, async () => { await refreshQueue(); });
 
-  // ── Room changes from DB (co-hosts, etc) ────────────────────────────────────
   realtimeChannel
     .on('postgres_changes', {
-      event: 'UPDATE',
-      schema: 'public',
-      table: 'rooms',
-      filter: `id=eq.${ROOM_ID}`,
+      event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${ROOM_ID}`,
     }, async (payload) => {
+      const previousTrackIndex = state.roomData?.current_track_index ?? 0;
       state.roomData = payload.new;
       state.loop = payload.new.loop || false;
       dom.loopBtn.classList.toggle('active', state.loop);
-
       const isCoHost = payload.new.co_hosts?.includes(state.user.id);
       state.isController = state.isHost || isCoHost;
       setHostMode(state.isController);
+
+      const currentTrackIndex = payload.new.current_track_index || 0;
+      if (previousTrackIndex !== currentTrackIndex) {
+        const track = state.queue[currentTrackIndex];
+        if (track) loadTrack(track, false);
+      }
+
+      syncAudio({
+        serverTime: Date.now(),
+        audioPosition: estimateRoomPosition(payload.new),
+        isPlaying: payload.new.is_playing,
+      });
+      updatePlayState(payload.new.is_playing);
       renderQueue();
       renderListeners(realtimeChannel.presenceState());
     });
 
-  // ── Subscribe ───────────────────────────────────────────────────────────────
   await realtimeChannel.subscribe(async (status) => {
     if (status === 'SUBSCRIBED') {
-      dom.connectionBadge.textContent = '● Conectado';
+      dom.connectionBadge.textContent = 'Conectado';
       dom.connectionBadge.className = 'badge badge-green';
-
-      // Track presence
       await realtimeChannel.track({
         user_id: state.user.id,
         display_name: state.profile?.display_name || state.user.email,
@@ -1109,7 +1009,7 @@ async function subscribeToRoom() {
         is_host: state.isHost,
       });
     } else if (status === 'CHANNEL_ERROR') {
-      dom.connectionBadge.textContent = '○ Erro';
+      dom.connectionBadge.textContent = 'Erro';
       dom.connectionBadge.className = 'badge badge-muted';
     }
   });
@@ -1128,12 +1028,29 @@ async function refreshQueue() {
   state.queue = data || [];
   renderQueue();
 
-  // Reload track if current changed
   const track = state.queue[state.roomData?.current_track_index || 0];
-  if (track && track.id !== state.currentTrack?.id) {
-    updateNowPlayingUI(track);
-    // Don't auto-play just from queue refresh
+  if (track) {
+    const isCurrentTrack = state.currentTrack && track.id === state.currentTrack.id;
+    const urlChanged = isCurrentTrack && track.audio_url !== state.currentTrack.audio_url;
+    if (!isCurrentTrack) {
+      loadTrack(track, false);
+    }
+    if (urlChanged) {
+      loadTrack(track, state.roomData?.is_playing);
+    }
+    if (state.roomData?.is_playing) {
+      syncAudio({
+        serverTime: Date.now(),
+        audioPosition: estimateRoomPosition(),
+        isPlaying: true,
+      });
+    }
   } else if (!track) {
+    state.currentTrack = null;
+    audio.removeAttribute('src');
+    audio.removeAttribute('data-track-id');
+    audio.removeAttribute('data-track-url');
+    audio.load();
     updateNowPlayingUI(null);
   }
 }
@@ -1151,27 +1068,20 @@ async function loadRoomState() {
   const isCoHost = room.co_hosts?.includes(state.user.id);
   state.isController = state.isHost || isCoHost;
 
-  // Determine host/listener UI
   setHostMode(state.isController);
   dom.roomCodeDisplay.textContent = ROOM_ID;
 
-  // Load queue
   await refreshQueue();
 
-  // Load current track and sync audio
   const track = state.queue[room.current_track_index || 0];
   if (track) {
+    // Load the track into audio element but don't play yet (user must click join)
     loadTrack(track, false);
-    state.currentTrack = track;
-
-    // Sync position
-    const pos = room.audio_offset || 0;
-    const elapsed = room.is_playing && room.started_at
-      ? (Date.now() - new Date(room.started_at).getTime()) / 1000
-      : 0;
-    const currentPos = pos + elapsed;
-
-    syncAudio({ serverTime: Date.now(), audioPosition: currentPos, isPlaying: room.is_playing });
+    syncAudio({
+      serverTime: Date.now(),
+      audioPosition: estimateRoomPosition(room),
+      isPlaying: false,
+    });
     updatePlayState(room.is_playing);
   }
 
@@ -1199,7 +1109,7 @@ dom.loopBtn.addEventListener('click', async () => {
 
 dom.progressBarTrack.addEventListener('click', (e) => {
   if (!state.isController) return;
-  const dur = state.currentTrack?.duration || audio.duration || 0;
+  const dur = audio.duration || state.currentTrack?.duration || 0;
   if (!dur) return;
   const { left, width } = dom.progressBarTrack.getBoundingClientRect();
   hostSeek(((e.clientX - left) / width) * dur);
@@ -1220,64 +1130,58 @@ let lastVol = 1;
 dom.volumeSlider.addEventListener('input', () => {
   const v = parseFloat(dom.volumeSlider.value);
   audio.volume = lastVol = v;
-  if (ytPlayerReady && ytPlayer && typeof ytPlayer.setVolume === 'function') {
-    try {
-      ytPlayer.setVolume(v * 100);
-    } catch (e) {}
-  }
   updateVolumeIcon(v);
 });
 
 dom.volumeIcon.addEventListener('click', () => {
-  const isCurrentlyMuted = audio.volume === 0 || (ytPlayerReady && ytPlayer && typeof ytPlayer.getVolume === 'function' && ytPlayer.getVolume() === 0);
-
-  if (!isCurrentlyMuted) {
-    lastVol = audio.volume || (ytPlayerReady && ytPlayer && typeof ytPlayer.getVolume === 'function' ? ytPlayer.getVolume() / 100 : 1) || 1;
+  if (audio.volume > 0) {
+    lastVol = audio.volume;
     audio.volume = 0;
-    if (ytPlayerReady && ytPlayer && typeof ytPlayer.setVolume === 'function') {
-      try {
-        ytPlayer.setVolume(0);
-      } catch (e) {}
-    }
     dom.volumeSlider.value = 0;
     updateVolumeIcon(0);
   } else {
     audio.volume = lastVol;
-    if (ytPlayerReady && ytPlayer && typeof ytPlayer.setVolume === 'function') {
-      try {
-        ytPlayer.setVolume(lastVol * 100);
-      } catch (e) {}
-    }
     dom.volumeSlider.value = lastVol;
     updateVolumeIcon(lastVol);
   }
 });
 
 // Copy
-dom.copyCodeBtn.addEventListener('click', () => navigator.clipboard.writeText(ROOM_ID).then(() => showToast('Código copiado!', 'success')));
-dom.copyLinkBtn.addEventListener('click', () => navigator.clipboard.writeText(`${location.origin}/room.html?room=${ROOM_ID}`).then(() => showToast('Link copiado!', 'success')));
+dom.copyCodeBtn.addEventListener('click', () =>
+  navigator.clipboard.writeText(ROOM_ID).then(() => showToast('Código copiado!', 'success')));
+dom.copyLinkBtn.addEventListener('click', () =>
+  navigator.clipboard.writeText(`${location.origin}/room.html?room=${ROOM_ID}`).then(() => showToast('Link copiado!', 'success')));
 
-// Close Room
-dom.closeRoomBtn.addEventListener('click', async () => {
-  if (!confirm('Deseja realmente fechar esta sala? Todos os ouvintes serão desconectados.')) return;
-
-  if (realtimeChannel) {
-    try {
-      realtimeChannel.send({
-        type: 'broadcast',
-        event: 'playback:roomClosed',
-        payload: {}
-      });
-    } catch (e) {}
-  }
-
-  const { error } = await sb.from('rooms').delete().eq('id', ROOM_ID);
-  if (error) {
-    showToast('Erro ao fechar sala: ' + error.message, 'error');
-  } else {
-    window.location.href = '/';
-  }
+// Exit Room
+dom.closeRoomBtn.addEventListener('click', () => {
+  window.location.href = '/';
 });
+
+// Theme Toggle
+if (dom.themeToggle) {
+  const sunIcon = dom.themeToggle.querySelector('.theme-icon-sun');
+  const moonIcon = dom.themeToggle.querySelector('.theme-icon-moon');
+  
+  const updateIcons = () => {
+    const isLight = document.documentElement.classList.contains('light-theme');
+    if (isLight) {
+      if (sunIcon) sunIcon.style.display = 'none';
+      if (moonIcon) moonIcon.style.display = 'block';
+    } else {
+      if (sunIcon) sunIcon.style.display = 'block';
+      if (moonIcon) moonIcon.style.display = 'none';
+    }
+  };
+
+  // Run on load
+  updateIcons();
+
+  dom.themeToggle.addEventListener('click', () => {
+    const isLight = document.documentElement.classList.toggle('light-theme');
+    localStorage.setItem('syncbeat_theme', isLight ? 'light' : 'dark');
+    updateIcons();
+  });
+}
 
 // Tabs
 document.querySelectorAll('.add-tab').forEach((tab) => {
@@ -1319,9 +1223,56 @@ function requestSyncWithHost() {
     realtimeChannel.send({
       type: 'broadcast',
       event: 'playback:requestSync',
-      payload: { requesterId: state.user.id }
+      payload: { requesterId: state.user.id },
     });
   }
+}
+
+async function refreshRoomPlaybackState() {
+  if (!state.user || !state.roomData) return;
+
+  const { data: room, error } = await sb.from('rooms').select('*').eq('id', ROOM_ID).single();
+  if (error || !room) {
+    audio.pause();
+    dom.closedMessage.textContent = `Sala "${ROOM_ID}" não encontrada.`;
+    dom.closedOverlay.style.display = 'flex';
+    return;
+  }
+
+  const previousTrackIndex = state.roomData?.current_track_index ?? 0;
+  state.roomData = room;
+  state.loop = room.loop || false;
+  dom.loopBtn.classList.toggle('active', state.loop);
+
+  const currentTrackIndex = room.current_track_index || 0;
+  if (previousTrackIndex !== currentTrackIndex || !state.currentTrack) {
+    const track = state.queue[currentTrackIndex];
+    if (track) loadTrack(track, false);
+  }
+
+  if (state.currentTrack) {
+    syncAudio({
+      serverTime: Date.now(),
+      audioPosition: estimateRoomPosition(room),
+      isPlaying: room.is_playing,
+    });
+  }
+  updatePlayState(room.is_playing);
+  renderQueue();
+}
+
+function startPlaybackSyncLoop() {
+  if (syncTimerId) clearInterval(syncTimerId);
+  syncTimerId = setInterval(() => {
+    if (!document.hidden) refreshRoomPlaybackState();
+  }, SYNC_INTERVAL_MS);
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      refreshRoomPlaybackState();
+      requestSyncWithHost();
+    }
+  });
 }
 
 function showJoinButton() {
@@ -1330,39 +1281,40 @@ function showJoinButton() {
 
   const isHostUser = state.roomData?.host_id === state.user.id;
   const welcomeText = isHostUser
-    ? 'Tudo pronto! Você é o host e controla a reprodução.'
-    : 'A sala está pronta! Clique abaixo para se conectar e ouvir junto com o host.';
+    ? 'Tudo pronto! Você é o host — controla a fila e o playback para todos.'
+    : 'A sala está pronta! Clique abaixo para entrar e ouvir junto com o host.';
 
   card.innerHTML = `
-    <div style="font-size:2.5rem;margin-bottom:16px;">🎵</div>
-    <h2 style="margin-bottom:8px;">SyncBeat</h2>
-    <p style="margin:12px 0 24px;color:var(--text-secondary);font-size:0.95rem;">${welcomeText}</p>
-    <button id="join-room-active-btn" class="btn btn-primary" style="width:100%;padding:14px;font-size:1rem;font-weight:700;">
-      Entrar e Ouvir Junto
+    <div style="margin-bottom:20px;">
+      <div style="width:64px;height:64px;background:var(--accent);border-radius:12px;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;box-shadow:var(--shadow-accent);color:#061019;">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" width="34" height="34"><path d="M9 3v10.55A4 4 0 1 0 11 17V7h4V3H9z"/></svg>
+      </div>
+      <h2 style="margin-bottom:8px;font-family:'Space Grotesk',sans-serif;">SyncBeat</h2>
+    </div>
+    <p style="margin:0 0 28px;color:var(--text-secondary);font-size:0.95rem;line-height:1.6;">${welcomeText}</p>
+    <button id="join-room-active-btn" class="btn btn-primary" style="width:100%;padding:16px;font-size:1rem;font-weight:700;border-radius:14px;">
+      🎵 Entrar e Ouvir Junto
     </button>
   `;
 
   document.getElementById('join-room-active-btn').addEventListener('click', () => {
-    // Destrava o áudio do contexto HTML5
-    try {
-      getOrCreateAudioCtx().resume();
-    } catch(e) {}
+    audioUnlocked = true;
 
-    // Destrava e ativa o YouTube player se aplicável
-    const isYt = state.currentTrack?.source_type === 'youtube' || state.currentTrack?.source_type === 'spotify';
-    if (isYt && ytPlayerReady && ytPlayer && typeof ytPlayer.playVideo === 'function') {
-      try {
-        ytPlayer.unMute();
-      } catch(e) {}
+    // Unlock AudioContext with user gesture
+    try { getOrCreateAudioCtx().resume(); } catch(e) {}
+
+    // If there's a track playing, sync and play
+    if (state.currentTrack && state.roomData) {
+      syncAudio({
+        serverTime: Date.now(),
+        audioPosition: estimateRoomPosition(),
+        isPlaying: state.roomData.is_playing,
+      });
     }
 
-    // Efeito suave de saída no overlay
     dom.joinOverlay.style.animation = 'toastOut .3s ease forwards';
-    setTimeout(() => {
-      dom.joinOverlay.style.display = 'none';
-    }, 300);
+    setTimeout(() => { dom.joinOverlay.style.display = 'none'; }, 300);
 
-    // Solicita sincronia de tempo imediata com o host
     requestSyncWithHost();
   });
 }
@@ -1374,7 +1326,6 @@ function showJoinButton() {
 async function init() {
   const session = await Auth.getSession();
   if (!session) {
-    // Redirect to login, preserving room code
     window.location.href = `/?room=${ROOM_ID}`;
     return;
   }
@@ -1382,7 +1333,6 @@ async function init() {
   state.user = session.user;
   state.profile = await Auth.getProfile();
 
-  // Update header avatar
   const name = state.profile?.display_name || state.user.email?.split('@')[0] || '?';
   const avatarUrl = state.profile?.avatar_url;
   dom.userNameHeader.textContent = name;
@@ -1395,12 +1345,10 @@ async function init() {
     dom.userAvatarHeader.textContent = Auth.getInitials(name);
   }
 
-  // Carrega os dados da sala e assina canais em segundo plano
   await loadRoomState();
   await subscribeToRoom();
+  startPlaybackSyncLoop();
   startVisualizer();
-
-  // Exibe o botão de confirmação de entrada para destravar o autoplay no clique do usuário
   showJoinButton();
 }
 

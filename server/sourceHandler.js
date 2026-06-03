@@ -1,6 +1,7 @@
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const fetch = require('node-fetch');
 
 // Attempt to load spotify-web-api-node; if missing, Spotify support is disabled
 let SpotifyWebApi;
@@ -38,6 +39,26 @@ function runYtDlp(args) {
   });
 }
 
+function buildStreamPath(url) {
+  return `/api/stream?url=${encodeURIComponent(url)}`;
+}
+
+function extractSpotifyTrackId(url) {
+  const match = url.match(/spotify\.com\/(?:intl-[a-z]+\/)?track\/([A-Za-z0-9]+)/);
+  return match?.[1] || null;
+}
+
+async function resolveStreamUrl(url) {
+  const directUrl = await runYtDlp([
+    '-f', 'bestaudio',
+    '-g',
+    '--no-playlist',
+    url,
+  ]);
+
+  return directUrl.split('\n')[0];
+}
+
 /**
  * Extract track info (title, uploader, duration, thumbnail, audioUrl) from a URL.
  */
@@ -46,27 +67,19 @@ async function resolveYouTubeUrl(url) {
   const jsonStr = await runYtDlp([
     '--dump-json',
     '--no-playlist',
-    '--format', 'bestaudio',
+    '--skip-download',
     url,
   ]);
   const info = JSON.parse(jsonStr);
-
-  // Get the direct audio stream URL
-  const audioUrl = await runYtDlp([
-    '-f', 'bestaudio',
-    '-g',
-    '--no-playlist',
-    url,
-  ]);
 
   return {
     name: info.title || 'Unknown',
     artist: info.uploader || info.channel || 'Unknown',
     duration: info.duration || 0,
     thumbnail: info.thumbnail || null,
-    audioUrl: audioUrl.split('\n')[0], // take first URL if multiple
+    audioUrl: buildStreamPath(info.webpage_url || url),
     sourceType: 'youtube',
-    originalUrl: url,
+    originalUrl: info.webpage_url || url,
   };
 }
 
@@ -78,24 +91,17 @@ async function searchYouTube(query) {
   const jsonStr = await runYtDlp([
     '--dump-json',
     '--no-playlist',
-    '--format', 'bestaudio',
+    '--skip-download',
     searchQuery,
   ]);
   const info = JSON.parse(jsonStr);
-
-  const audioUrl = await runYtDlp([
-    '-f', 'bestaudio',
-    '-g',
-    '--no-playlist',
-    info.webpage_url,
-  ]);
 
   return {
     name: info.title || 'Unknown',
     artist: info.uploader || info.channel || 'Unknown',
     duration: info.duration || 0,
     thumbnail: info.thumbnail || null,
-    audioUrl: audioUrl.split('\n')[0],
+    audioUrl: buildStreamPath(info.webpage_url),
     sourceType: 'youtube',
     originalUrl: info.webpage_url,
   };
@@ -135,37 +141,61 @@ async function ensureSpotifyToken() {
   }
 }
 
+async function getSpotifyMetadata(url) {
+  try {
+    if (!spotifyApi) throw new Error('Spotify API credentials not configured.');
+    if (!(await ensureSpotifyToken())) throw new Error('Could not authenticate with Spotify.');
+
+    const trackId = extractSpotifyTrackId(url);
+    if (!trackId) throw new Error('Invalid Spotify track URL. Expected format: https://open.spotify.com/track/...');
+
+    const { body: track } = await spotifyApi.getTrack(trackId);
+    const artistName = track.artists.map((a) => a.name).join(', ');
+
+    return {
+      trackName: track.name,
+      artistName,
+      duration: Math.round(track.duration_ms / 1000),
+      thumbnail: track.album.images?.[0]?.url || null,
+      searchQuery: `${track.name} ${artistName} audio`,
+    };
+  } catch (apiErr) {
+    const res = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, {
+      timeout: 8000,
+    });
+    const data = await res.json();
+    if (!res.ok || !data.title) throw apiErr;
+
+    return {
+      trackName: data.title,
+      artistName: 'Spotify',
+      duration: 0,
+      thumbnail: data.thumbnail_url || null,
+      searchQuery: `${data.title} audio`,
+    };
+  }
+}
+
 /**
  * Resolve a Spotify track URL → get metadata → search YouTube → get audio URL.
  */
 async function resolveSpotifyUrl(url) {
-  if (!spotifyApi) throw new Error('Spotify support not configured.');
-  if (!(await ensureSpotifyToken())) throw new Error('Could not authenticate with Spotify.');
+  const trackId = extractSpotifyTrackId(url);
+  if (!trackId) throw new Error('Invalid Spotify track URL. Expected format: https://open.spotify.com/track/...');
 
-  // Extract track ID from URL like: https://open.spotify.com/track/TRACK_ID
-  const match = url.match(/spotify\.com\/track\/([A-Za-z0-9]+)/);
-  if (!match) throw new Error('Invalid Spotify track URL. Expected format: https://open.spotify.com/track/...');
-
-  const trackId = match[1];
-  const { body: track } = await spotifyApi.getTrack(trackId);
-
-  const artistName = track.artists.map((a) => a.name).join(', ');
-  const trackName = track.name;
-  const duration = Math.round(track.duration_ms / 1000);
-  const thumbnail = track.album.images?.[0]?.url || null;
-
-  console.log(`[Spotify] Resolved: "${trackName}" by ${artistName} — searching YouTube...`);
+  const metadata = await getSpotifyMetadata(url);
 
   // Search YouTube for the best match
-  const ytResult = await searchYouTube(`${trackName} ${artistName}`);
+  const ytResult = await searchYouTube(metadata.searchQuery);
 
   return {
     ...ytResult,
-    name: trackName,
-    artist: artistName,
-    duration,
-    thumbnail,
+    name: metadata.trackName,
+    artist: metadata.artistName,
+    duration: metadata.duration,
+    thumbnail: metadata.thumbnail,
     sourceType: 'spotify',
+    originalUrl: url,
     spotifyId: trackId,
   };
 }
@@ -237,7 +267,7 @@ async function resolveSource(input) {
   }
 
   // Spotify URLs
-  if (/spotify\.com\/track\//.test(trimmed)) {
+  if (/spotify\.com\/(?:intl-[a-z]+\/)?track\//.test(trimmed)) {
     return await resolveSpotifyUrl(trimmed);
   }
 
@@ -259,6 +289,7 @@ async function resolveSource(input) {
 module.exports = {
   resolveSource,
   resolveUpload,
+  resolveStreamUrl,
   initSpotify,
   checkYtDlp,
 };
