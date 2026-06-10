@@ -76,7 +76,7 @@ test('PWA shell is installable and caches both desktop and mobile frontends', ()
 
   assert.deepEqual(pngSize('client', 'icons', 'icon-192.png'), { width: 192, height: 192 });
   assert.deepEqual(pngSize('client', 'icons', 'icon-512.png'), { width: 512, height: 512 });
-  assert.match(serviceWorker, /syncbeat-pwa-v3/);
+  assert.match(serviceWorker, /syncbeat-pwa-v4/);
   assert.match(serviceWorker, /NETWORK_FIRST_PATHS/);
   assert.match(serviceWorker, /install/);
   assert.match(serviceWorker, /fetch/);
