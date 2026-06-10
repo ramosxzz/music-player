@@ -10,9 +10,9 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="SyncBeat" />
   <link rel="manifest" href="/manifest.webmanifest" />
-  <link rel="apple-touch-icon" href="/logo.png" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
   <link rel="stylesheet" href="/style.css" />
-  <link rel="icon" href="/logo.png" />
+  <link rel="icon" href="/icons/icon-192.png" />
   <script>
     (function() {
       const theme = localStorage.getItem('syncbeat_theme') || 'dark';
@@ -27,7 +27,9 @@
   <main class="mobile-home-shell">
     <header class="mobile-home-topbar">
       <div class="mobile-brand">
-        <img src="/logo.png" alt="SyncBeat Logo" />
+        <span class="syncbeat-mobile-mark" aria-hidden="true">
+          <span></span>
+        </span>
         <div>
           <strong>SyncBeat</strong>
           <span>Ouça junto</span>
@@ -40,8 +42,8 @@
     </header>
 
     <section class="mobile-home-hero">
-      <div class="mobile-logo-orbit">
-        <img src="/logo.png" alt="SyncBeat Logo" />
+      <div class="mobile-logo-orbit syncbeat-mobile-mark large" aria-hidden="true">
+        <span></span>
       </div>
       <h1>Sync<span>Beat</span></h1>
       <p>YouTube em sala, controle do host e reprodução sincronizada.</p>

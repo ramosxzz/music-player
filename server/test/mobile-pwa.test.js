@@ -11,6 +11,12 @@ const read = (...parts) => {
   return fs.readFileSync(target, 'utf8');
 };
 
+const pngSize = (...parts) => {
+  const buffer = fs.readFileSync(file(...parts));
+  assert.equal(buffer.toString('ascii', 1, 4), 'PNG');
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+};
+
 test('desktop and mobile frontends use separate HTML shells with device routing', () => {
   const indexHtml = read('client', 'index.html');
   const mobileHtml = read('client', 'mobile.html');
@@ -23,6 +29,7 @@ test('desktop and mobile frontends use separate HTML shells with device routing'
   assert.match(indexHtml, /\/js\/device-router\.js/);
   assert.match(roomHtml, /\/js\/device-router\.js/);
   assert.match(mobileHtml, /class="mobile-home-page"/);
+  assert.match(mobileHtml, /syncbeat-mobile-mark/);
   assert.match(roomMobileHtml, /class="mobile-room-page"/);
   assert.match(mobileHtml, /id="landing-section"/);
   assert.match(mobileHtml, /id="room-section"/);
@@ -67,7 +74,10 @@ test('PWA shell is installable and caches both desktop and mobile frontends', ()
     assert.match(html, /apple-mobile-web-app-capable/);
   }
 
-  assert.match(serviceWorker, /syncbeat-pwa-v2/);
+  assert.deepEqual(pngSize('client', 'icons', 'icon-192.png'), { width: 192, height: 192 });
+  assert.deepEqual(pngSize('client', 'icons', 'icon-512.png'), { width: 512, height: 512 });
+  assert.match(serviceWorker, /syncbeat-pwa-v3/);
+  assert.match(serviceWorker, /NETWORK_FIRST_PATHS/);
   assert.match(serviceWorker, /install/);
   assert.match(serviceWorker, /fetch/);
   assert.match(serviceWorker, /mobile\.html/);

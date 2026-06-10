@@ -1,4 +1,4 @@
-const CACHE_NAME = 'syncbeat-pwa-v2';
+const CACHE_NAME = 'syncbeat-pwa-v3';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -17,6 +17,21 @@ const APP_SHELL = [
   '/js/supabase-client.js',
   '/js/ui.js',
 ];
+const NETWORK_FIRST_PATHS = new Set([
+  '/',
+  '/index.html',
+  '/mobile.html',
+  '/room.html',
+  '/room-mobile.html',
+  '/style.css',
+  '/manifest.webmanifest',
+  '/js/app.js',
+  '/js/auth.js',
+  '/js/device-router.js',
+  '/js/room.js',
+  '/js/supabase-client.js',
+  '/js/ui.js',
+]);
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -44,7 +59,23 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
 
   event.respondWith(
-    caches.match(request).then((cached) => {
+    caches.match(request).then(async (cached) => {
+      const isNetworkFirst = NETWORK_FIRST_PATHS.has(url.pathname);
+
+      if (isNetworkFirst) {
+        try {
+          const response = await fetch(request, { cache: 'reload' });
+          if (response && response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        } catch {
+          if (cached) return cached;
+          throw new Error('Network request failed and no cache is available.');
+        }
+      }
+
       const network = fetch(request)
         .then((response) => {
           if (response && response.ok) {
