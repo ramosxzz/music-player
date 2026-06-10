@@ -9,8 +9,7 @@ function showToast(message, type = 'info', duration = 3500) {
   const container = document.getElementById('toast-container');
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
-  const icons = { success: '✅', error: '❌', info: 'ℹ️' };
-  toast.innerHTML = `<span>${icons[type] || ''}</span><span>${message}</span>`;
+  toast.innerHTML = `<span class="toast-dot"></span><span>${message}</span>`;
   container.appendChild(toast);
   setTimeout(() => {
     toast.style.animation = 'toastOut 0.3s ease forwards';
@@ -21,6 +20,19 @@ function showToast(message, type = 'info', duration = 3500) {
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+}
+
+function isMobileExperience() {
+  return document.body.classList.contains('mobile-home-page')
+    || window.matchMedia?.('(max-width: 760px)').matches;
+}
+
+function getRoomPagePath() {
+  return isMobileExperience() ? '/room-mobile.html' : '/room.html';
+}
+
+function goToRoom(roomId) {
+  window.location.href = `${getRoomPagePath()}?room=${roomId}`;
 }
 
 // ─── Auth UI ──────────────────────────────────────────────────────────────────
@@ -76,10 +88,6 @@ document.getElementById('login-google-btn').addEventListener('click', async () =
   await Auth.loginWithGoogle();
 });
 
-document.getElementById('login-spotify-btn').addEventListener('click', async () => {
-  await Auth.loginWithSpotify();
-});
-
 logoutBtn.addEventListener('click', async () => {
   await Auth.logout();
   showToast('Você saiu da conta.', 'info');
@@ -109,7 +117,7 @@ document.getElementById('create-btn').addEventListener('click', async () => {
 
     // Save host flag and go to room
     sessionStorage.setItem('syncbeat_host', 'true');
-    window.location.href = `/room.html?room=${roomId}`;
+    goToRoom(roomId);
   } catch (err) {
     showToast('Erro ao criar sala: ' + err.message, 'error');
     btn.disabled = false;
@@ -145,27 +153,18 @@ async function loadMyRooms() {
       const trackCount = room.queue_items?.[0]?.count || 0;
       const item = document.createElement('div');
       item.className = 'glass my-room-item';
-      item.style.cssText = `
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 16px 20px;
-        border-radius: var(--radius-md);
-        background: rgba(255, 255, 255, 0.02);
-        border: 1px solid var(--border);
-      `;
 
       item.innerHTML = `
-        <div style="display: flex; flex-direction: column; gap: 4px;">
-          <div style="display: flex; align-items: center; gap: 12px;">
-            <span style="font-family: var(--font-display); font-weight: 700; font-size: 1.15rem; letter-spacing: 0.05em; color: var(--text-primary);">${room.id}</span>
-            <span class="badge badge-muted" style="font-size: 0.72rem; padding: 2px 8px; border-radius: 4px;">${trackCount} ${trackCount === 1 ? 'música' : 'músicas'}</span>
+        <div class="my-room-copy">
+          <div class="my-room-title-row">
+            <span class="my-room-code">${room.id}</span>
+            <span class="badge badge-muted">${trackCount} ${trackCount === 1 ? 'música' : 'músicas'}</span>
           </div>
-          <span style="font-size: 0.75rem; color: var(--text-muted);">Criada em ${new Date(room.created_at).toLocaleDateString('pt-BR')} às ${new Date(room.created_at).toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</span>
+          <span class="my-room-date">Criada em ${new Date(room.created_at).toLocaleDateString('pt-BR')} às ${new Date(room.created_at).toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</span>
         </div>
-        <div style="display: flex; align-items: center; gap: 8px;">
-          <button class="btn btn-secondary btn-sm enter-my-room-btn" data-room="${room.id}" style="padding: 8px 16px; font-size: 0.85rem;">Entrar</button>
-          <button class="btn btn-ghost btn-sm delete-my-room-btn" data-room="${room.id}" style="padding: 8px 12px; font-size: 0.85rem; border-color: rgba(244, 63, 94, 0.2); color: var(--red);">Excluir</button>
+        <div class="my-room-actions">
+          <button class="btn btn-secondary btn-sm enter-my-room-btn" data-room="${room.id}">Entrar</button>
+          <button class="btn btn-ghost btn-sm delete-my-room-btn" data-room="${room.id}">Excluir</button>
         </div>
       `;
       listEl.appendChild(item);
@@ -175,13 +174,20 @@ async function loadMyRooms() {
     listEl.querySelectorAll('.enter-my-room-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         sessionStorage.setItem('syncbeat_host', 'true');
-        window.location.href = `/room.html?room=${btn.dataset.room}`;
+        goToRoom(btn.dataset.room);
       });
     });
 
     listEl.querySelectorAll('.delete-my-room-btn').forEach(btn => {
       btn.addEventListener('click', async () => {
-        if (!confirm(`Deseja realmente excluir a sala ${btn.dataset.room} e toda a sua fila de músicas?`)) return;
+        const confirmed = await SyncBeatUI.confirm({
+          title: `Excluir sala ${btn.dataset.room}?`,
+          message: 'A sala e toda a fila de músicas serão removidas para todos.',
+          confirmLabel: 'Excluir sala',
+          cancelLabel: 'Cancelar',
+          tone: 'danger',
+        });
+        if (!confirmed) return;
         btn.disabled = true;
         btn.innerHTML = '...';
         const { error: delErr } = await sb.from('rooms').delete().eq('id', btn.dataset.room);
@@ -224,7 +230,7 @@ document.getElementById('join-btn').addEventListener('click', async () => {
   }
 
   sessionStorage.removeItem('syncbeat_host');
-  window.location.href = `/room.html?room=${code}`;
+  goToRoom(code);
 });
 
 document.getElementById('join-code').addEventListener('keydown', (e) => {
@@ -242,7 +248,7 @@ if (urlCode) {
   if (codeInput) {
     codeInput.value = urlCode.toUpperCase();
     // Scroll to join card
-    codeInput.closest('.index-card')?.scrollIntoView({ behavior: 'smooth' });
+    codeInput.closest('.index-card, .mobile-action-card')?.scrollIntoView({ behavior: 'smooth' });
   }
 }
 

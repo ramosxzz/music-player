@@ -42,16 +42,6 @@ window.Auth = (function () {
     });
   }
 
-  async function loginWithSpotify() {
-    return sb.auth.signInWithOAuth({
-      provider: 'spotify',
-      options: {
-        redirectTo: window.location.origin + '/auth-callback.html',
-        scopes: 'user-read-email user-read-private',
-      },
-    });
-  }
-
   async function logout() {
     _session = null;
     _profile = null;
@@ -105,7 +95,6 @@ window.Auth = (function () {
     getUser,
     getProfile,
     loginWithGoogle,
-    loginWithSpotify,
     logout,
     onAuthStateChange,
     requireAuth,

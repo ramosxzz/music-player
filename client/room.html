@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncBeat — Sala</title>
   <meta name="description" content="Sala de música sincronizada em tempo real." />
+  <meta name="theme-color" content="#090a0f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SyncBeat" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/logo.png" />
   <link rel="stylesheet" href="/style.css" />
   <link rel="icon" href="/logo.png" />
   <script>
@@ -15,8 +21,9 @@
       }
     })();
   </script>
+  <script src="/js/device-router.js"></script>
 </head>
-<body>
+<body class="desktop-room-page">
   <!-- Loading Overlay -->
   <div class="overlay" id="join-overlay">
     <div class="glass overlay-card" style="text-align:center;">
@@ -36,7 +43,7 @@
   </div>
 
   <!-- ── Room Layout ──────────────────────────────────────────────────────────── -->
-  <div class="room-page" id="room-page">
+  <div class="room-page claude-room-layout" id="room-page">
 
     <!-- Header -->
     <header class="room-header">
@@ -54,7 +61,10 @@
         </div>
       </div>
       <div class="room-header-right">
-        <span class="badge badge-green" id="connection-badge">Conectando...</span>
+        <span class="sync-status-pill">
+          <span class="sync-live-dot" aria-hidden="true"></span>
+          <span class="badge badge-green" id="connection-badge">Conectando...</span>
+        </span>
         <span id="host-badge" class="badge badge-accent" style="display:none;">Host</span>
         <button id="close-room-btn" class="btn btn-ghost btn-sm" style="display:none; margin-left: 8px;">Sair da Sala</button>
         <button id="theme-toggle" class="btn-theme-toggle" style="margin-left: 8px;" aria-label="Alterar Tema">
@@ -105,61 +115,54 @@
         <div class="add-music-tabs">
           <button class="add-tab active" data-tab="search" id="tab-search">Buscar</button>
           <button class="add-tab" data-tab="url" id="tab-url">URL</button>
-          <button class="add-tab" data-tab="upload" id="tab-upload">Upload</button>
         </div>
 
         <div class="add-tab-content active" id="tab-content-search">
-          <p style="font-size:.82rem;color:var(--text-muted);margin-bottom:10px;">
-            Busca no YouTube. Cole também links do YouTube ou Spotify.
+          <p class="form-hint">
+            Busque uma música ou cole um link.
           </p>
           <div class="input-row">
             <input type="text" id="search-input"
-              placeholder="Nome da música, artista, link do YouTube/Spotify..." autocomplete="off" />
+              placeholder="Nome da música, artista ou link..." autocomplete="off" />
             <button class="btn btn-primary" id="search-btn">Buscar</button>
           </div>
           <div id="search-status" style="margin-top:10px;font-size:.85rem;color:var(--text-muted);min-height:20px;"></div>
         </div>
 
         <div class="add-tab-content" id="tab-content-url">
-          <p style="font-size:.82rem;color:var(--text-muted);margin-bottom:10px;">
-            Cole qualquer URL de áudio direto ou link do YouTube/Spotify.
+          <p class="form-hint">
+            Cole o link da música.
           </p>
           <div class="input-row">
-            <input type="url" id="url-input" placeholder="https://..." autocomplete="off" />
+            <input type="url" id="url-input"
+              placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" />
             <button class="btn btn-primary" id="url-add-btn">Adicionar</button>
           </div>
           <div id="url-status" style="margin-top:10px;font-size:.85rem;color:var(--text-muted);min-height:20px;"></div>
-        </div>
-
-        <div class="add-tab-content" id="tab-content-upload">
-          <div class="file-drop-area" id="file-drop-area">
-            <div class="drop-icon" style="display: flex; align-items: center; justify-content: center; margin-bottom: 12px;">
-              <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted)"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-            </div>
-            <p>Arraste arquivos ou <strong>clique para selecionar</strong></p>
-            <small>MP3, WAV, OGG, FLAC, M4A — até 50 MB</small>
-            <input type="file" id="fileInput" accept="audio/*" multiple />
-          </div>
-          <div id="upload-status" style="margin-top:10px;font-size:.85rem;color:var(--text-muted);min-height:20px;"></div>
-        </div>
-      </div>
-
-      <!-- Queue -->
-      <div class="glass queue-section">
-        <div class="section-header">
-          <span class="section-title">Fila</span>
-          <span class="badge badge-muted" id="queue-count">0 músicas</span>
-        </div>
-        <div id="queue-list">
-          <div class="queue-empty">A fila está vazia.</div>
         </div>
       </div>
 
     </main>
 
+    <!-- Queue -->
+    <aside class="room-queue-rail">
+      <div class="glass queue-section">
+        <div class="section-header">
+          <span class="section-title">Fila</span>
+          <div class="queue-header-actions">
+            <span class="badge badge-muted" id="queue-count">0 músicas</span>
+            <button class="btn btn-ghost btn-sm clear-queue-btn" id="clear-queue-btn" style="display:none;">Limpar fila</button>
+          </div>
+        </div>
+        <div id="queue-list">
+          <div class="queue-empty">A fila está vazia.</div>
+        </div>
+      </div>
+    </aside>
+
     <!-- Sidebar -->
     <aside class="room-sidebar">
-      <div class="visualizer-container">
+      <div class="visualizer-container sound-ribbon">
         <canvas id="visualizer"></canvas>
       </div>
       <div class="sidebar-section">
@@ -218,13 +221,17 @@
 
   </div>
 
+  <div class="playback-engine" id="youtube-player-shell" aria-hidden="true">
+    <div id="youtube-iframe-player"></div>
+  </div>
+
   <div id="toast-container"></div>
-  <audio id="audio-player"></audio>
 
 
 
   <!-- Scripts -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="/js/ui.js"></script>
   <script src="/js/supabase-client.js"></script>
   <script src="/js/auth.js"></script>
   <script src="/js/room.js"></script>

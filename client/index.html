@@ -4,7 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncBeat — Ouça Junto</title>
-  <meta name="description" content="Player de música sincronizado em tempo real. YouTube, Spotify, upload. Crie uma sala e ouça junto com seus amigos." />
+  <meta name="description" content="Player de YouTube sincronizado em tempo real. Crie uma sala e ouça junto com seus amigos." />
+  <meta name="theme-color" content="#090a0f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SyncBeat" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/logo.png" />
   <link rel="stylesheet" href="/style.css" />
   <link rel="icon" href="/logo.png" />
   <script>
@@ -15,8 +21,9 @@
       }
     })();
   </script>
+  <script src="/js/device-router.js"></script>
 </head>
-<body>
+<body class="desktop-home-page">
   <div style="position: fixed; top: 20px; right: 20px; z-index: 100;">
     <button id="theme-toggle" class="btn-theme-toggle" aria-label="Alterar Tema">
       <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="theme-icon-sun" style="display:none;"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
@@ -24,7 +31,7 @@
     </button>
   </div>
 
-  <main class="page index-page">
+  <main class="page index-page syncbeat-ambient-shell">
     <div class="index-hero">
 
       <div class="index-logo">
@@ -33,18 +40,16 @@
 
       <h1>Sync<span>Beat</span></h1>
       <p>Ouça músicas <strong>sincronizadas</strong> com seus amigos em tempo real.<br>
-         YouTube, Spotify, uploads — tudo em um só lugar.</p>
+         YouTube oficial, salas compartilhadas e controle em tempo real.</p>
 
       <div class="features">
         <span class="feature-tag">YouTube</span>
-        <span class="feature-tag">Spotify</span>
-        <span class="feature-tag">Upload</span>
-        <span class="feature-tag">URL Direta</span>
+        <span class="feature-tag">Player Oficial</span>
         <span class="feature-tag">Tempo Real</span>
       </div>
 
       <!-- ── Landing: Login Buttons ─────────────────────────────────────────── -->
-      <div id="landing-section" style="margin-top: 40px;">
+      <div id="landing-section" class="claude-home-actions" style="margin-top: 40px;">
         <p style="font-size: 0.95rem; margin-bottom: 20px;">Faça login para criar ou entrar em uma sala</p>
         <div style="display: flex; flex-direction: column; gap: 12px; max-width: 320px; margin: 0 auto;">
 
@@ -58,20 +63,11 @@
             </svg>
             Continuar com Google
           </button>
-
-          <button class="btn" id="login-spotify-btn"
-            style="background:#0a0a0a;color:#fff;border:1px solid rgba(255,255,255,.15);gap:12px;padding:13px 24px;font-size:.95rem;">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
-              <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/>
-            </svg>
-            Continuar com Spotify
-          </button>
-
         </div>
       </div>
 
       <!-- ── Logged in: Room Actions ─────────────────────────────────────────── -->
-      <div id="room-section" style="display: none; margin-top: 40px;">
+      <div id="room-section" class="claude-home-actions" style="display: none; margin-top: 40px;">
 
         <!-- User info header -->
         <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:32px;">
@@ -131,6 +127,7 @@
 
   <!-- Supabase SDK -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="/js/ui.js"></script>
   <script src="/js/supabase-client.js"></script>
   <script src="/js/auth.js"></script>
   <script src="/js/app.js"></script>

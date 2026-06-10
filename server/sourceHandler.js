@@ -30,9 +30,24 @@ function runYtDlp(args) {
     const proc = spawn('yt-dlp', args);
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
     proc.stdout.on('data', (d) => (stdout += d.toString()));
     proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('error', (err) => {
+      if (err.code === 'ENOENT') {
+        fail(new Error('yt-dlp is not installed or is not available in PATH.'));
+        return;
+      }
+      fail(new Error(`yt-dlp failed to start: ${err.message}`));
+    });
     proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       if (code === 0) resolve(stdout.trim());
       else reject(new Error(`yt-dlp error: ${stderr.slice(0, 500)}`));
     });

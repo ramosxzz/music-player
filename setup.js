@@ -69,16 +69,23 @@ async function createStorageBucket() {
 async function main() {
   console.log('\n🎵 SyncBeat — Setup automático\n');
 
-  // 1. Apply SQL schema
-  console.log('📦 Aplicando schema SQL...');
-  const sqlPath = path.join(__dirname, 'supabase', 'migrations', '001_initial.sql');
-  const sql = fs.readFileSync(sqlPath, 'utf-8');
+  // 1. Apply SQL migrations
+  console.log('📦 Aplicando migrações SQL...');
+  const migrationsDir = path.join(__dirname, 'supabase', 'migrations');
+  const migrationFiles = fs.readdirSync(migrationsDir)
+    .filter((file) => file.endsWith('.sql'))
+    .sort();
 
   try {
-    await runSQL(sql);
-    console.log('✅ Schema aplicado com sucesso!');
+    for (const file of migrationFiles) {
+      const sqlPath = path.join(migrationsDir, file);
+      const sql = fs.readFileSync(sqlPath, 'utf-8');
+      console.log(`   → ${file}`);
+      await runSQL(sql);
+    }
+    console.log('✅ Migrações aplicadas com sucesso!');
   } catch (err) {
-    console.error('❌ Falha ao aplicar o schema:', err.message);
+    console.error('❌ Falha ao aplicar migrações:', err.message);
     process.exit(1);
   }
 
